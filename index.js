@@ -53,6 +53,41 @@ app.get("/lobby", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// --- Bağlantı nabzı (heartbeat) -------------------------------------------
+// Sorun: Bir oyuncunun ağı sessizce koparsa (uçak modu, uygulama arka
+// planda öldürülürse, wifi/mobil veri kesilirse) WebSocket'in 'close'
+// olayı TCP katmanında çok geç (bazen hiç) tetiklenebilir; bu da diğer
+// oyuncunun "rakip ayrıldı / kazandın" mesajını dakikalarca beklemesine
+// yol açar. Çözüm: sunucu her HEARTBEAT_MS'de bir istemcilere 'ping'
+// gönderir; bir önceki turda 'pong' ile cevap vermeyen bağlantı ölü kabul
+// edilip terminate() edilir -> bu da anında leaveRoom() tetikler ve
+// rakibe 'opponent-left' gider.
+const HEARTBEAT_MS = 5000; // her 5 saniyede bir nabız kontrolü
+
+function heartbeat() {
+  this.isAlive = true;
+}
+
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+});
+
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      // İki tur üst üste cevap yok -> bağlantı sessizce kopmuş, hemen
+      // sonlandır (bu 'close' olayını tetikler ve rakibe bildirim gider).
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (e) { /* yoksay */ }
+  });
+}, HEARTBEAT_MS);
+
+wss.on("close", () => clearInterval(heartbeatInterval));
+// ---------------------------------------------------------------------------
+
 /**
  * @typedef {Object} Room
  * @property {string} id
