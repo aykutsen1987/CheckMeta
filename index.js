@@ -21,6 +21,15 @@
  *  6. Bağlantı koparsa oda düşmanına {type:'opponent-left'} gider.
  *
  * Oda kodu: 4 karakterli (A-Z 0-9), kolay paylaşılabilir.
+ *
+ * Hızlı Eşleşme (Quick Match / otomatik rakip bulma):
+ *  - İstemci {type:'quick-match'} gönderir.
+ *  - Kuyrukta bekleyen başka bir oyuncu varsa hemen eşleştirilir ve
+ *    her ikisine de {type:'start', ...} yollanır (oda kodu olmadan).
+ *  - Kuyrukta kimse yoksa istemci kuyruğa eklenir ve {type:'queued'}
+ *    cevabı döner ("rakip aranıyor" ekranı bunu dinler).
+ *  - İstemci {type:'cancel-quick-match'} ile kuyruktan çıkabilir.
+ *  - Bağlantı koparsa kuyruktan otomatik olarak çıkarılır.
  * ---------------------------------------------------------
  */
 
@@ -35,7 +44,7 @@ const app = express();
 
 // Basit sağlık kontrolü (Render ve diğer PaaS'lar bunu kullanır).
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "checkmeta-server", rooms: rooms.size });
+  res.json({ ok: true, service: "checkmeta-server", rooms: rooms.size, queued: quickQueue.length });
 });
 
 app.get("/healthz", (req, res) => res.status(200).send("ok"));
@@ -98,6 +107,51 @@ wss.on("close", () => clearInterval(heartbeatInterval));
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 
+// --- Hızlı Eşleşme (Quick Match) kuyruğu ----------------------------------
+// Rakip bekleyen (henüz eşleşmemiş) bağlantıların listesi. Basit bir FIFO:
+// kuyruğa giren ilk oyuncu, sıradaki ilk gelenle eşleşir.
+/** @type {import('ws').WebSocket[]} */
+const quickQueue = [];
+
+function removeFromQueue(ws) {
+  const idx = quickQueue.indexOf(ws);
+  if (idx !== -1) quickQueue.splice(idx, 1);
+  ws.inQueue = false;
+}
+
+function startRoomFor(wsA, wsB) {
+  // İlk eşleşen siyah (ilk hamle), ikinci beyaz olur.
+  const roomId = generateRoomCode();
+  /** @type {Room} */
+  const room = { id: roomId, players: new Map(), order: [wsA.peerId, wsB.peerId] };
+  room.players.set(wsA.peerId, wsA);
+  room.players.set(wsB.peerId, wsB);
+  wsA.room = room;
+  wsB.room = room;
+  rooms.set(roomId, room);
+
+  send(wsA, { type: "start", roomId, color: "black", opponent: wsB.name });
+  send(wsB, { type: "start", roomId, color: "white", opponent: wsA.name });
+}
+
+function tryQuickMatch(ws) {
+  if (ws.room) leaveRoom(ws);
+  if (ws.inQueue) return; // zaten kuyrukta
+
+  // Kuyrukta bekleyen (ve hâlâ bağlı olan) başka bir oyuncu var mı?
+  while (quickQueue.length > 0) {
+    const opponent = quickQueue.shift();
+    opponent.inQueue = false;
+    if (opponent === ws || opponent.readyState !== opponent.OPEN) continue;
+    return startRoomFor(opponent, ws);
+  }
+
+  // Kuyruk boş -> bu oyuncuyu kuyruğa ekle, rakip aranıyor bilgisini gönder.
+  ws.inQueue = true;
+  quickQueue.push(ws);
+  return send(ws, { type: "queued" });
+}
+
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // karışabilen 0/O, 1/I çıkarıldı
 
 function generateRoomCode() {
@@ -129,6 +183,7 @@ function otherPeerId(room, peerId) {
 }
 
 function leaveRoom(ws) {
+  removeFromQueue(ws);
   const room = ws.room;
   if (!room) return;
   // Kalan oyuncuya ayrıldığını bildir.
@@ -144,6 +199,7 @@ function leaveRoom(ws) {
 wss.on("connection", (ws) => {
   ws.peerId = Math.random().toString(36).slice(2, 10);
   ws.room = null;
+  ws.inQueue = false;
   ws.name = "Player";
 
   ws.on("message", (raw) => {
@@ -163,6 +219,7 @@ wss.on("connection", (ws) => {
       }
 
       case "create": {
+        removeFromQueue(ws);
         if (ws.room) leaveRoom(ws);
         const roomId = generateRoomCode();
         /** @type {Room} */
@@ -180,7 +237,18 @@ wss.on("connection", (ws) => {
         });
       }
 
+      case "quick-match": {
+        tryQuickMatch(ws);
+        return;
+      }
+
+      case "cancel-quick-match": {
+        removeFromQueue(ws);
+        return;
+      }
+
       case "join": {
+        removeFromQueue(ws);
         const roomId = (msg.roomId || "").toString().toUpperCase().trim();
         const room = rooms.get(roomId);
         if (!room) return send(ws, { type: "error", message: "Oda bulunamadı" });
